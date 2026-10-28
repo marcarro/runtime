@@ -563,6 +563,15 @@ GenTree* Lowering::LowerNode(GenTree* node)
                 return next;
             }
 
+#if defined(TARGET_XARCH) || defined(TARGET_ARM64)
+            // The mask has to fit the immediate of the target's 'and', which we've only checked for xarch, arm64.
+            if (m_compiler->opts.OptimizationEnabled() && TryLowerShiftPairToAnd(node->AsOp()))
+            {
+                // The pair is now an AND, lower it as one.
+                return LowerBinaryArithmetic(node->AsOp());
+            }
+#endif // TARGET_XARCH || TARGET_ARM64
+
 #if defined(TARGET_XARCH) || defined(TARGET_ARM64) || defined(TARGET_LOONGARCH64) || defined(TARGET_RISCV64)
             LowerShift(node->AsOp());
 #else
@@ -8886,6 +8895,91 @@ void Lowering::TryRemoveShiftRotateMask(GenTreeOp* op)
         op->gtOp2->ClearContained();
     }
 }
+
+#if defined(TARGET_XARCH) || defined(TARGET_ARM64)
+//------------------------------------------------------------------------
+// TryLowerShiftPairToAnd: Try replacing a pair of opposite shifts with an AND.
+//
+// Arguments:
+//    outer - the outer shift node (GT_LSH or GT_RSZ)
+//
+// Return Value:
+//    True if the pair was replaced with a GT_AND, which is not lowered yet.
+//
+// Notes:
+//    LSH(RSH/RSZ(x, N), N) clears the low N bits of x, so it is x & ~((1 << N) - 1).
+//    RSZ(LSH(x, N), N) clears the high N bits of x, so it is x & ((1 << (W - N)) - 1).
+//
+//    We do this after CSE on purpose. Folding it in morph removes a use of a shared inner shift, which can
+//    make CSE stop sharing it. After CSE that shift is a local, so we don't see a pair there.
+//
+bool Lowering::TryLowerShiftPairToAnd(GenTreeOp* outer)
+{
+    if (!outer->OperIs(GT_LSH, GT_RSZ))
+    {
+        return false;
+    }
+
+    GenTree* inner      = outer->gtGetOp1();
+    GenTree* outerCount = outer->gtGetOp2();
+
+    const bool isPair = outer->OperIs(GT_LSH) ? inner->OperIs(GT_RSH, GT_RSZ) : inner->OperIs(GT_LSH);
+    if (!isPair || !outerCount->IsCnsIntOrI() || !inner->AsOp()->gtGetOp2()->IsCnsIntOrI())
+    {
+        return false;
+    }
+
+    if (!outer->TypeIs(TYP_INT, TYP_LONG) || (inner->TypeGet() != outer->TypeGet()) || outer->gtSetFlags() ||
+        outer->isContained() || inner->gtSetFlags() || inner->isContained())
+    {
+        return false;
+    }
+
+    // Shift counts are masked to the width of the type. A count of zero after masking is a no-op,
+    // so we leave it alone.
+    const unsigned width      = genTypeSize(outer) * BITS_PER_BYTE;
+    const unsigned shiftMask  = width - 1;
+    const unsigned outerShift = static_cast<unsigned>(outerCount->AsIntCon()->IconValue()) & shiftMask;
+    const unsigned innerShift = static_cast<unsigned>(inner->AsOp()->gtGetOp2()->AsIntCon()->IconValue()) & shiftMask;
+
+    if ((outerShift == 0) || (outerShift != innerShift))
+    {
+        return false;
+    }
+
+    const uint64_t one  = 1;
+    const ssize_t  mask =
+        static_cast<ssize_t>(outer->OperIs(GT_LSH) ? (UINT64_MAX << outerShift) : ((one << (width - outerShift)) - 1));
+
+#ifdef TARGET_XARCH
+    // An 'and' only takes a sign-extended imm32. A 64-bit mask that doesn't fit needs a separate
+    // 'mov reg, imm64', which costs more than the two shifts.
+    if ((width == 64) && !GenTreeIntConCommon::FitsInI32(mask))
+    {
+        return false;
+    }
+#endif
+
+    GenTree* const x          = inner->AsOp()->gtGetOp1();
+    GenTree* const innerCount = inner->AsOp()->gtGetOp2();
+
+    JITDUMP("Replacing a pair of shifts with an AND\n");
+
+    BlockRange().Remove(innerCount);
+    BlockRange().Remove(inner);
+
+    x->ClearContained();
+    x->ClearRegOptional();
+
+    outer->ChangeOper(GT_AND);
+    outer->gtOp1 = x;
+
+    outerCount->gtType = outer->TypeGet();
+    outerCount->AsIntCon()->SetValueTruncating(mask);
+
+    return true;
+}
+#endif // TARGET_XARCH || TARGET_ARM64
 
 //------------------------------------------------------------------------
 // LowerShift: Lower shift nodes

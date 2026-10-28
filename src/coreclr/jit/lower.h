@@ -422,6 +422,9 @@ private:
     GenTree* LowerAdd(GenTreeOp* node);
     GenTree* LowerMul(GenTreeOp* mul);
     bool     TryLowerAndNegativeOne(GenTreeOp* node, GenTree** nextNode);
+#if defined(TARGET_XARCH) || defined(TARGET_ARM64)
+    bool TryLowerShiftPairToAnd(GenTreeOp* outer);
+#endif // TARGET_XARCH || TARGET_ARM64
     GenTree* LowerBinaryArithmetic(GenTreeOp* binOp);
     GenTree* LowerUnsignedDivOrMod(GenTreeOp* divMod);
     bool     TryLowerConstIntUDivOrUMod(GenTreeOp* divMod);
